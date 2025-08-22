@@ -1,238 +1,281 @@
 import express from "express";
 import axios from "axios";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 
 const router = express.Router();
 const dbName = process.env.DB_NAME;
 const uri = process.env.MONGODB_URI;
 let client;
 
-// 🔌 Mongo client (singleton)
 async function getClient() {
   if (!client) {
+    console.log("🟢 Connecting to MongoDB...");
     client = new MongoClient(uri);
     await client.connect();
+    console.log("✅ MongoDB connected");
   }
   return client;
 }
 
-// 🛠 Enrich product with local images + normalize shape
-async function enrichWithLocalImages(item, db) {
-  const product = item.product_variation?.product || {};
-  const variation = item.product_variation || {};
+// ----------------- helper functions (same as your findOrCreateProduct, findOrCreateCondition, etc.) -----------------
 
-  const name = `${product.manufacturer || ""} ${product.model || ""} ${
-    product.variant || ""
+async function findOrCreateProduct(productData, db) {
+  const productsCollection = db.collection("tep_admin_products");
+  const name = `${productData.manufacturer || ""} ${
+    productData.model || ""
   }`.trim();
 
-  // Lookup in local DB
-  const localProduct = await db.collection("tep_admin_products").findOne({
+  let product = await productsCollection.findOne({
     name: { $regex: name, $options: "i" },
   });
 
-  // WholeCell color fallback
-  const wholecellColorImages = product.color
-    ? [
-        {
-          colorName: product.color,
-          colorValue: product.color,
-          images: [],
-          _id: `wholecell-color-${item.id}`,
-        },
-      ]
-    : [];
-
-  const localColorImages = Array.isArray(localProduct?.imagesByColor)
-    ? localProduct.imagesByColor
-    : [];
-
-  return {
-    sku: String(item.product_variation.sku),
-    productId: item.product_variation.product.id,
-    vendor: "wholecell",
-    name: `${product.manufacturer || ""} ${product.model || ""}`.trim(),
-    title: `${product.manufacturer || ""} ${product.model || ""}`.trim(),
-    description: `${product.variant ? product.variant + " " : ""}${
-      product.capacity ? product.capacity + "GB " : ""
-    }${product.network || ""}`.trim(),
-    price: Number(item.total_price_paid) || 0,
-    discount: 0,
-    currency: "USD",
-    stock: item.status === "Sold" ? 0 : 1,
-    inStock: item.status !== "Sold",
-    category: localProduct?.category || null,
-    categories: [product.manufacturer || "Unknown"],
-    brand: product.manufacturer,
-    condition: variation.grade || localProduct?.condition || "Unknown",
-    imagesByColor: [...wholecellColorImages, ...localColorImages],
-    images: [],
-    specifications: {
-      storage: product.capacity ? `${product.capacity}GB` : null,
-      _extra: {
-        sku: variation.sku,
-        network: product.network,
-        variant: product.variant,
-        grade: variation.grade,
-        esn: item.esn,
-        hex_id: item.hex_id,
-        warehouse: item.warehouse?.name,
-        location: item.location?.name,
-        order_id: item.order_id,
-        purchase_order_id: item.purchase_order_id,
-      },
-    },
-    tags: [
-      product.manufacturer,
-      product.model,
-      product.color,
-      variation.grade,
-      item.status,
-    ].filter(Boolean),
-    isFeatured: false,
-    updatedAt: new Date(item.updated_at),
-    createdAt: new Date(item.created_at),
-  };
+  if (!product) {
+    const newProduct = {
+      name,
+      manufacturer: productData.manufacturer || "Unknown",
+      model: productData.model || "",
+      category: productData.manufacturer || "Unknown",
+      imagesByColor: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await productsCollection.insertOne(newProduct);
+    product = { _id: result.insertedId, ...newProduct };
+  }
+  return product;
 }
 
-function aggregateStock(items) {
-  const stockMap = {};
+async function findOrCreateCondition(grade, db) {
+  const conditionsCollection = db.collection("conditions");
+  let condition = await conditionsCollection.findOne({
+    name: { $regex: grade || "Unknown", $options: "i" },
+  });
+
+  if (!condition) {
+    const newCondition = {
+      name: grade || "Unknown",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await conditionsCollection.insertOne(newCondition);
+    condition = { _id: result.insertedId, ...newCondition };
+  }
+  return condition;
+}
+
+function groupItemsByProductAndCondition(items) {
+  const grouped = new Map();
   items.forEach((item) => {
-    const sku = item.product_variation.sku;
-    if (!stockMap[sku]) {
-      stockMap[sku] = {
-        ...item,
-        stock: 1,
-      };
-    } else {
-      stockMap[sku].stock += 1;
+    const product = item.product_variation?.product || {};
+    const variation = item.product_variation || {};
+    const productKey = `${product.manufacturer || ""}_${
+      product.model || ""
+    }`.trim();
+    const conditionKey = variation.grade || "Unknown";
+    const groupKey = `${productKey}_${conditionKey}`;
+    if (!grouped.has(groupKey)) {
+      grouped.set(groupKey, {
+        product,
+        variation,
+        condition: conditionKey,
+        items: [],
+      });
+    }
+    grouped.get(groupKey).items.push(item);
+  });
+  return grouped;
+}
+
+function createSelectedOptions(items) {
+  const optionsMap = new Map();
+  items.forEach((item) => {
+    const product = item.product_variation?.product || {};
+    const variation = item.product_variation || {};
+    const color = product.color || "Unknown";
+    const capacity = product.capacity ? `${product.capacity}GB` : "";
+    const variant = product.variant || capacity || "Standard";
+    const optionKey = `${color}_${variant}`;
+    if (!optionsMap.has(optionKey)) {
+      optionsMap.set(optionKey, {
+        color,
+        variant,
+        stock: 0,
+        price: Number(item.total_price_paid) || 0,
+        discount: 0,
+        uniqueNumbers: [],
+        _id: new ObjectId(),
+      });
+    }
+    const option = optionsMap.get(optionKey);
+    if (item.status !== "Sold") {
+      option.stock += 1;
+      option.uniqueNumbers.push(
+        item.esn || item.hex_id || variation.sku || `item_${item.id}`
+      );
     }
   });
-  return Object.values(stockMap);
+  return Array.from(optionsMap.values());
 }
 
-router.get("/", async (req, res) => {
-  try {
-    const vendorUrl =
-      "https://api.wholecell.io/api/v1/inventories?status=Available";
-    const authHeader =
-      "Basic cUh3U2lSNENPdndiUkdpcmdCUk9LQVZoR2JMbGVaeHlQX1lGSExUQmFGaFE6RmJOQ3NibzVTcW80MVo5T3lCdWFtd3NkQUY1dlhQUnpLN2I5LXhVcHE5dlE=";
+// ----------------- SYNC FUNCTION (per vendor) -----------------
 
-    // 1️⃣ Fetch vendor items
-    const resp = await axios.get(vendorUrl, {
-      headers: { Accept: "application/json", Authorization: authHeader },
-    });
-    const vendorItems = Array.isArray(resp.data.data) ? resp.data.data : [];
-    const vendorList = aggregateStock(vendorItems);
+async function syncVendor(vendorApi, db) {
+  const vendorProductsCollection = db.collection("tep_vendor_products");
 
-    // 2️⃣ Connect DB
-    const client = await getClient();
-    const db = client.db(dbName);
-    const productsCollection = db.collection("products");
+  // build auth header from vendor API creds
+  const authHeader =
+    "Basic " +
+    Buffer.from(`${vendorApi.appId}:${vendorApi.appSecret}`).toString("base64");
 
-    // Ensure index exists
-    await productsCollection.createIndex(
-      { externalId: 1, vendor: 1 },
-      { unique: true, background: true }
-    );
+  console.log(authHeader);
 
-    // Load existing products for lookup
-    const existingProducts = await productsCollection
-      .find({}, { projection: { externalId: 1, stock: 1, updatedAt: 1 } })
-      .toArray();
+  console.log(`🌍 Fetching items for vendorId=${vendorApi.vendorId}...`);
+  const resp = await axios.get(`${process.env.VENDOR_API_BASE_URL}`, {
+    headers: { Accept: "application/json", Authorization: authHeader },
+  });
 
-    const externalIdMap = new Map();
-    existingProducts.forEach((p) => {
-      externalIdMap.set(p.externalId, p);
-    });
+  const vendorItems = Array.isArray(resp.data.data) ? resp.data.data : [];
+  console.log(
+    `✅ Vendor ${vendorApi.vendorId}: fetched ${vendorItems.length} items`
+  );
 
-    // 3️⃣ Process incoming items
-    const bulkOps = [];
-    let newProducts = 0,
-      updatedProducts = 0,
-      markedAsOutOfStock = 0;
+  // Group items
+  const groupedItems = groupItemsByProductAndCondition(vendorItems);
+  const bulkOps = [];
+  let newVendorProducts = 0;
+  let updatedVendorProducts = 0;
+  let markedAsOutOfStock = 0;
 
-    const seenExternalIds = new Set();
-
-    // Group by SKU
-    const skuGroupedItems = new Map();
-    for (const item of vendorList) {
-      const sku = item?.product_variation?.sku;
-      if (!sku) continue;
-      if (!skuGroupedItems.has(sku)) {
-        skuGroupedItems.set(sku, { ...item, totalStock: item.stock || 0 });
-      } else {
-        const existing = skuGroupedItems.get(sku);
-        existing.totalStock += item.stock || 0;
-      }
-    }
-
-    for (const [sku, mergedItem] of skuGroupedItems.entries()) {
-      const normalized = await enrichWithLocalImages(mergedItem, db);
+  for (const [groupKey, groupData] of groupedItems.entries()) {
+    try {
+      const product = await findOrCreateProduct(groupData.product, db);
+      const selectedOptions = createSelectedOptions(groupData.items);
 
       if (
-        normalized.stock <= 0 &&
-        (!mergedItem.totalStock || mergedItem.totalStock <= 0)
-      )
+        !selectedOptions.length ||
+        selectedOptions.every((opt) => opt.stock === 0)
+      ) {
         continue;
+      }
 
-      normalized.stock = mergedItem.totalStock;
-      seenExternalIds.add(normalized.externalId);
+      const existing = await vendorProductsCollection.findOne({
+        vendorId: vendorApi.vendorId,
+        product: product._id,
+        condition: condition._id,
+      });
 
-      const existingById = externalIdMap.get(normalized.externalId);
-      if (existingById) {
-        updatedProducts++;
+      const vendorProductData = {
+        vendorId: vendorApi.vendorId,
+        product: product._id,
+        condition: condition._id,
+        selectedOptions,
+        updatedAt: new Date(),
+      };
+
+      if (existing) {
+        updatedVendorProducts++;
         bulkOps.push({
           updateOne: {
             filter: {
-              externalId: normalized.externalId,
-              vendor: normalized.vendor,
+              vendorId: vendorApi.vendorId,
+              product: product._id,
+              condition: condition._id,
             },
-            update: { $set: normalized },
-            upsert: true,
+            update: { $set: vendorProductData },
           },
         });
       } else {
-        newProducts++;
-        bulkOps.push({ insertOne: { document: normalized } });
-      }
-    }
-
-    // 4️⃣ Mark missing DB products as stock=0
-    for (const existing of existingProducts) {
-      if (!seenExternalIds.has(existing.externalId)) {
-        markedAsOutOfStock++;
+        newVendorProducts++;
         bulkOps.push({
-          updateOne: {
-            filter: { externalId: existing.externalId },
-            update: {
-              $set: { stock: 0, inStock: false, updatedAt: new Date() },
-            },
+          insertOne: {
+            document: { ...vendorProductData, createdAt: new Date() },
           },
         });
       }
+    } catch (err) {
+      console.error(`❌ Error processing group ${groupKey}`, err);
     }
+  }
 
-    // 5️⃣ Commit bulk operations
-    if (bulkOps.length > 0) {
-      await productsCollection.bulkWrite(bulkOps, { ordered: false });
+  // mark out-of-stock
+  const existingVendorProducts = await vendorProductsCollection
+    .find({ vendorId: vendorApi.vendorId })
+    .toArray();
+  const currentCombinations = new Set();
+  for (const [groupKey, groupData] of groupedItems.entries()) {
+    const product = await findOrCreateProduct(groupData.product, db);
+    currentCombinations.add(`${product._id}_${condition._id}`);
+  }
+
+  for (const existing of existingVendorProducts) {
+    const key = `${existing.product}_${existing.condition}`;
+    if (!currentCombinations.has(key)) {
+      markedAsOutOfStock++;
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: existing._id },
+          update: {
+            $set: {
+              selectedOptions: existing.selectedOptions.map((opt) => ({
+                ...opt,
+                stock: 0,
+                uniqueNumbers: [],
+              })),
+              updatedAt: new Date(),
+            },
+          },
+        },
+      });
     }
+  }
 
-    res.json({
-      message: "Products synced successfully",
-      summary: {
-        totalFetched: vendorList.length,
-        newProducts,
-        updatedProducts,
-        markedAsOutOfStock,
-        totalOperations: bulkOps.length,
-      },
-    });
-  } catch (err) {
-    console.error(
-      "❌ GET /products error:",
-      err?.response?.data || err?.message || err
+  if (bulkOps.length) {
+    await vendorProductsCollection.bulkWrite(bulkOps, { ordered: false });
+  }
+
+  return {
+    vendorId: vendorApi.vendorId.toString(),
+    totalFetched: vendorItems.length,
+    groupsProcessed: groupedItems.size,
+    newVendorProducts,
+    updatedVendorProducts,
+    markedAsOutOfStock,
+    totalOperations: bulkOps.length,
+  };
+}
+
+// ----------------- ROUTE -----------------
+
+router.get("/", async (req, res) => {
+  try {
+    console.log("🚀 Starting sync for all vendors...");
+    const client = await getClient();
+    const db = client.db(dbName);
+
+    // fetch all vendors from tep_admin_wholesale_apis
+    const vendorApis = await db
+      .collection("tep_admin_wholesale_apis")
+      .find({})
+      .toArray();
+    console.log(`📡 Found ${vendorApis.length} vendor API configs`);
+
+    // run all vendors in parallel
+    const results = await Promise.allSettled(
+      vendorApis.map((api) => syncVendor(api, db))
     );
-    res.status(500).json({ error: "Failed to sync products" });
+
+    const summary = results.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      return {
+        vendorId: vendorApis[i].vendorId.toString(),
+        error: r.reason?.message || "Failed",
+      };
+    });
+
+    res.json({ message: "All vendor sync complete", summary });
+  } catch (err) {
+    console.error("❌ Sync error", err);
+    res.status(500).json({ error: "Failed to sync vendors" });
   }
 });
 
