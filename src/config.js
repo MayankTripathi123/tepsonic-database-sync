@@ -10,8 +10,6 @@ const base = {
   env,
   port: Number(process.env.PORT || 3000),
   syncToDb: (process.env.SYNC_TO_DB || "true").toLowerCase() === "true",
-  defaultVendor: process.env.DEFAULT_VENDOR || "wholesalerA",
-  cachePrefix: process.env.CACHE_PREFIX || "product-service:",
   mongoUri:
     process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/product_service",
   vendorApiBaseUrl:
