@@ -25,15 +25,12 @@ async function findExistingProduct(productData, adminProductsCollection) {
     productData.model || ""
   }`.trim();
 
-  console.log(`🔍 Searching for: "${name}"`);
-
   // Try exact match first
   let product = await adminProductsCollection.findOne({
     name: { $regex: `^${escapeRegex(name)}$`, $options: "i" },
   });
 
   if (product) {
-    console.log(`✅ Exact match found: "${product.name}"`);
     return product;
   }
 
@@ -98,7 +95,7 @@ async function createSelectedOptionsForWholecell(
 
     // Find the option that matches the capacity
     for (const option of storageOptions) {
-      if (option.includes(`${capacity}GB`)) {
+      if (option.includes(`${capacity.replace(" ", "").trim()}`)) {
         return option; // Return the full storage+RAM string
       }
     }
@@ -241,7 +238,6 @@ async function syncWholecellVendor(vendorApi, db) {
   });
 
   const vendorItems = Array.isArray(resp.data.data) ? resp.data.data : [];
-  console.log(`✅ Wholecell: fetched ${vendorItems.length} items`);
 
   // Group items by product and condition
   const groupedItems = groupItemsByProductAndCondition(vendorItems);
@@ -258,18 +254,10 @@ async function syncWholecellVendor(vendorApi, db) {
 
     if (existingProduct) {
       validGroups.set(groupKey, { ...groupData, existingProduct });
-      console.log(`✅ Found existing product: ${existingProduct.name}`);
     } else {
       skippedProducts++;
-      console.log(
-        `⚠️ Skipped non-existing product: ${groupData.product.manufacturer} ${groupData.product.model}`
-      );
     }
   }
-
-  console.log(
-    `📊 Processing ${validGroups.size} valid products, skipped ${skippedProducts} products`
-  );
 
   // STEP 2: Process only valid products (NO UPDATES to admin products)
   const bulkOps = [];
@@ -284,7 +272,6 @@ async function syncWholecellVendor(vendorApi, db) {
         groupData.items,
         adminProductsCollection
       );
-      console.log("SelectedOptions", selectedOptions);
 
       // Skip if no valid stock options
       if (
@@ -370,7 +357,6 @@ async function syncWholecellVendor(vendorApi, db) {
 
 router.get("/", async (req, res) => {
   try {
-    console.log("🚀 Starting sync for all vendors...");
     const client = await getClient();
     const db = client.db(dbName);
 
@@ -384,9 +370,6 @@ router.get("/", async (req, res) => {
     const updatedVendorApis = await Promise.all(
       vendorApis.map(async (api) => {
         if (!api.database) {
-          console.log(
-            `🔄 Setting database field to "wholecell" for vendor ${api.vendorId}`
-          );
           await db
             .collection("tep_admin_wholesale_apis")
             .updateOne({ _id: api._id }, { $set: { database: "wholecell" } });
@@ -396,18 +379,12 @@ router.get("/", async (req, res) => {
       })
     );
 
-    console.log(`📡 Found ${updatedVendorApis.length} vendor API configs`);
-
     // For Wholecell vendors, use the new sync function
     const results = await Promise.allSettled(
       updatedVendorApis.map((api) => {
         if (api.database === "wholecell") {
-          console.log(`🏥 Using Wholecell sync for vendor ${api.vendorId}`);
           return syncWholecellVendor(api, db);
         } else {
-          console.log(
-            `❌ No sync function for vendor ${api.vendorId} with database ${api.database}`
-          );
           return Promise.resolve({
             vendorId: api.vendorId.toString(),
             database: api.database,
@@ -446,7 +423,6 @@ router.get("/", async (req, res) => {
 // Route to sync only Wholecell vendors
 router.get("/wholecell", async (req, res) => {
   try {
-    console.log("🏥 Starting sync for Wholecell vendors only...");
     const client = await getClient();
     const db = client.db(dbName);
 
@@ -455,7 +431,6 @@ router.get("/wholecell", async (req, res) => {
       .collection("tep_admin_wholesale_apis")
       .find({ database: "wholecell" })
       .toArray();
-    console.log(`📡 Found ${vendorApis.length} Wholecell vendor API configs`);
 
     if (vendorApis.length === 0) {
       return res.json({
